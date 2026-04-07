@@ -1,78 +1,41 @@
-package dxl
+package dynamixel
 
 import (
 	"encoding/binary"
 	"fmt"
 	"time"
+
+	"go_dxl/motor"
+	"go_dxl/transport/serial"
 )
 
-// Protocol constants
+// Default timing constants
 const (
-	// ReadBufferSize is the size of the temporary buffer for reading serial data
-	ReadBufferSize = 1024
-	// MinHeaderSize is the minimum bytes needed to parse packet header and length
-	MinHeaderSize = 7 // Header(4) + ID(1) + Length(2)
-	// MaxPacketSize is the maximum valid packet size (prevents DoS on corrupted length)
-	MaxPacketSize = 1024
-	// DefaultTimeout is the default timeout for packet read operations
-	DefaultTimeout = 100 * time.Millisecond
+	DefaultTimeout      = 100 * time.Millisecond
+	DefaultPollInterval = 500 * time.Microsecond
 )
 
-// SerialPortInterface defines the contract for serial port operations.
-// Implementations must handle platform-specific serial I/O (Windows/Linux).
-// This interface enables dependency injection and mocking for unit tests.
-type SerialPortInterface interface {
-	// Read reads up to len(b) bytes into b from the serial port.
-	// Returns the number of bytes read (0 <= n <= len(b)) and any error encountered.
-	Read(b []byte) (int, error)
-
-	// Write writes len(b) bytes from b to the serial port.
-	// Returns the number of bytes written and any error encountered.
-	Write(b []byte) (int, error)
-
-	// Close closes the serial port and releases associated resources.
-	Close() error
-}
-
-// Flusher is an optional interface for serial ports that support buffer flushing
-type Flusher interface {
-	Flush() error
-}
-
-// DefaultPollInterval is the sleep duration when no serial data is available.
-const DefaultPollInterval = 500 * time.Microsecond
-
+// Driver implements low-level Dynamixel Protocol 2.0 communication.
+// It also implements motor.Motor when bound to a specific motor ID.
 type Driver struct {
-	port         SerialPortInterface
-	Timeout      time.Duration // Configurable timeout for read operations
-	PollInterval time.Duration // Sleep between read polls when no data (default 500µs)
+	port         serial.Port
+	Timeout      time.Duration
+	PollInterval time.Duration
 }
 
-func NewDriver(port SerialPortInterface) *Driver {
+// NewDriver creates a Dynamixel driver using the given serial port.
+func NewDriver(port serial.Port) *Driver {
 	return &Driver{port: port, Timeout: DefaultTimeout, PollInterval: DefaultPollInterval}
 }
 
-// Flush clears the serial port buffers if supported
+// Flush clears the serial port buffers if supported.
 func (d *Driver) Flush() {
-	if flusher, ok := d.port.(Flusher); ok {
+	if flusher, ok := d.port.(serial.Flusher); ok {
 		flusher.Flush()
 	}
 }
 
-// findPacketStart finds the start index of a valid packet header (FF FF FD)
-// Returns -1 if no valid header is found
-func findPacketStart(data []byte) int {
-	for i := 0; i < len(data)-2; i++ {
-		if data[i] == 0xFF && data[i+1] == 0xFF && data[i+2] == 0xFD {
-			return i
-		}
-	}
-	return -1
-}
-
-// readPacketWithTimeout reads a complete Dynamixel packet from the serial port.
-// It accumulates bytes until a valid packet (header + length + CRC) is received or timeout occurs.
-// Stale or corrupted packets are skipped automatically via CRC validation.
+// readPacketWithTimeout reads a complete Dynamixel packet with CRC validation.
 func (d *Driver) readPacketWithTimeout(timeout time.Duration) ([]byte, error) {
 	deadline := time.Now().Add(timeout)
 	buf := make([]byte, 0, ReadBufferSize)
@@ -84,37 +47,27 @@ func (d *Driver) readPacketWithTimeout(timeout time.Duration) ([]byte, error) {
 			return nil, err
 		}
 		if n == 0 {
-			// No data available — yield CPU to avoid busy-waiting.
-			// Critical on macOS/Linux where Read returns (0, nil) when no data.
 			time.Sleep(d.PollInterval)
 			continue
 		}
 		buf = append(buf, tmp[:n]...)
 
-		// Try to extract a valid packet from the buffer
 		for len(buf) >= MinHeaderSize {
-			startIdx := findPacketStart(buf)
-
+			startIdx := FindPacketStart(buf)
 			if startIdx == -1 {
-				// No header found — keep last 2 bytes (could be partial FF FF)
 				if len(buf) > 2 {
 					buf = buf[len(buf)-2:]
 				}
 				break
 			}
-
-			// Discard garbage bytes before header
 			if startIdx > 0 {
 				buf = buf[startIdx:]
 			}
-
 			if len(buf) < MinHeaderSize {
 				break
 			}
 
 			bodyLen := uint16(buf[5]) | (uint16(buf[6]) << 8)
-
-			// Invalid body length — skip this header, search for next
 			if int(bodyLen) > MaxPacketSize-MinHeaderSize {
 				buf = buf[3:]
 				continue
@@ -125,21 +78,16 @@ func (d *Driver) readPacketWithTimeout(timeout time.Duration) ([]byte, error) {
 				buf = buf[3:]
 				continue
 			}
-
 			if len(buf) < totalLen {
-				break // Need more data
+				break
 			}
 
-			// Complete packet found — validate CRC before accepting
 			pkt := buf[:totalLen]
 			receivedCRC := uint16(pkt[totalLen-2]) | (uint16(pkt[totalLen-1]) << 8)
 			calcCRC := UpdateCRC(0, pkt[:totalLen-2])
-
 			if receivedCRC == calcCRC {
-				return pkt, nil // Valid packet with correct CRC
+				return pkt, nil
 			}
-
-			// CRC mismatch — stale/corrupted packet, skip and continue
 			buf = buf[3:]
 		}
 	}
@@ -148,28 +96,22 @@ func (d *Driver) readPacketWithTimeout(timeout time.Duration) ([]byte, error) {
 }
 
 // Transfer sends a packet and waits for a response.
-// This is the fundamental request-response pattern for Dynamixel communication.
-// Flushes stale input data before sending, matching the official Dynamixel SDK behavior.
 func (d *Driver) Transfer(txPacket []byte) ([]byte, error) {
-	// Clear stale input data (official SDK calls clearPort/tcflush before txPacket)
 	d.Flush()
-
 	_, err := d.port.Write(txPacket)
 	if err != nil {
 		return nil, fmt.Errorf("write failed: %v", err)
 	}
-
 	return d.readPacketWithTimeout(d.Timeout)
 }
 
+// Write writes data to a motor register.
 func (d *Driver) Write(id uint8, addr uint16, data []byte) error {
-	// Build Packet
 	params := make([]byte, 2+len(data))
 	binary.LittleEndian.PutUint16(params[0:], addr)
 	copy(params[2:], data)
 
 	tx := BuildPacket(id, InstWrite, params)
-
 	rx, err := d.Transfer(tx)
 	if err != nil {
 		return err
@@ -185,14 +127,13 @@ func (d *Driver) Write(id uint8, addr uint16, data []byte) error {
 	return nil
 }
 
+// Read reads data from a motor register.
 func (d *Driver) Read(id uint8, addr uint16, length uint16) ([]byte, error) {
-	// Build Packet
 	params := make([]byte, 4)
 	binary.LittleEndian.PutUint16(params[0:], addr)
 	binary.LittleEndian.PutUint16(params[2:], length)
 
 	tx := BuildPacket(id, InstRead, params)
-
 	rx, err := d.Transfer(tx)
 	if err != nil {
 		return nil, err
@@ -208,6 +149,7 @@ func (d *Driver) Read(id uint8, addr uint16, length uint16) ([]byte, error) {
 	return readParams, nil
 }
 
+// Ping verifies communication with a motor.
 func (d *Driver) Ping(id uint8) (modelNum uint16, err error) {
 	tx := BuildPacket(id, InstPing, nil)
 	rx, err := d.Transfer(tx)
@@ -222,15 +164,39 @@ func (d *Driver) Ping(id uint8) (modelNum uint16, err error) {
 	if errCode != 0 {
 		return 0, fmt.Errorf("dxl error code: %02X", errCode)
 	}
-
 	if len(params) >= 3 {
 		modelNum = binary.LittleEndian.Uint16(params[0:])
 	}
 	return modelNum, nil
 }
 
-// Reboot sends a reboot instruction to the specified motor.
-// The motor will restart and re-initialize.
+// PingMotor implements motor.Motor.Ping returning ModelInfo.
+func (d *Driver) PingMotor(id uint8) (motor.ModelInfo, error) {
+	tx := BuildPacket(id, InstPing, nil)
+	rx, err := d.Transfer(tx)
+	if err != nil {
+		return motor.ModelInfo{}, err
+	}
+
+	_, errCode, params, err := ParsePacket(rx)
+	if err != nil {
+		return motor.ModelInfo{}, err
+	}
+	if errCode != 0 {
+		return motor.ModelInfo{}, fmt.Errorf("dxl error code: %02X", errCode)
+	}
+
+	info := motor.ModelInfo{}
+	if len(params) >= 2 {
+		info.ModelNumber = binary.LittleEndian.Uint16(params[0:])
+	}
+	if len(params) >= 3 {
+		info.Firmware = params[2]
+	}
+	return info, nil
+}
+
+// Reboot sends a reboot instruction to the motor.
 func (d *Driver) Reboot(id uint8) error {
 	tx := BuildPacket(id, InstReboot, nil)
 	rx, err := d.Transfer(tx)
@@ -247,11 +213,8 @@ func (d *Driver) Reboot(id uint8) error {
 	return nil
 }
 
-// FactoryReset resets the motor to factory default settings.
-// Level determines what is reset:
-//   - 0xFF: Reset all values
-//   - 0x01: Reset all except ID
-//   - 0x02: Reset all except ID and baud rate
+// FactoryReset resets the motor to factory defaults.
+// Level: 0xFF=all, 0x01=except ID, 0x02=except ID and baud rate.
 func (d *Driver) FactoryReset(id uint8, level uint8) error {
 	tx := BuildPacket(id, InstFactoryReset, []byte{level})
 	rx, err := d.Transfer(tx)
@@ -268,14 +231,14 @@ func (d *Driver) FactoryReset(id uint8, level uint8) error {
 	return nil
 }
 
-// Write4Byte Helper
+// Write4Byte writes a 4-byte value to a motor register.
 func (d *Driver) Write4Byte(id uint8, addr uint16, val uint32) error {
 	buf := make([]byte, 4)
 	binary.LittleEndian.PutUint32(buf, val)
 	return d.Write(id, addr, buf)
 }
 
-// Read4Byte Helper
+// Read4Byte reads a 4-byte value from a motor register.
 func (d *Driver) Read4Byte(id uint8, addr uint16) (uint32, error) {
 	data, err := d.Read(id, addr, 4)
 	if err != nil {
@@ -287,43 +250,34 @@ func (d *Driver) Read4Byte(id uint8, addr uint16) (uint32, error) {
 	return binary.LittleEndian.Uint32(data), nil
 }
 
-// SyncWriteData represents data for a single motor in sync write
+// SyncWriteData represents data for a single motor in a sync write operation.
 type SyncWriteData struct {
 	ID   uint8
 	Data []byte
 }
 
-// SyncWrite writes the same address to multiple motors in a single packet.
-// This is significantly more efficient than individual writes when controlling
-// multiple motors simultaneously (e.g., synchronized motion).
+// SyncWrite writes the same address range to multiple motors in a single packet.
 func (d *Driver) SyncWrite(addr uint16, dataLength uint16, motors []SyncWriteData) error {
 	if len(motors) == 0 {
 		return fmt.Errorf("no motors provided")
 	}
-
-	// Validate data length for all motors first
 	for _, m := range motors {
 		if len(m.Data) != int(dataLength) {
 			return fmt.Errorf("motor ID %d: data length mismatch (expected %d, got %d)", m.ID, dataLength, len(m.Data))
 		}
 	}
 
-	// Pre-allocate buffer with exact size to avoid reallocations
-	// Format: [Addr_L, Addr_H, Len_L, Len_H, [ID1, Data1...], [ID2, Data2...], ...]
 	totalSize := 4 + len(motors)*(1+int(dataLength))
 	params := make([]byte, 4, totalSize)
 	binary.LittleEndian.PutUint16(params[0:], addr)
 	binary.LittleEndian.PutUint16(params[2:], dataLength)
 
-	// Append motor data efficiently
 	for _, m := range motors {
 		params = append(params, m.ID)
 		params = append(params, m.Data...)
 	}
 
-	// Use broadcast ID (0xFE) - no status response expected
 	tx := BuildPacket(0xFE, InstSyncWrite, params)
-
 	n, err := d.port.Write(tx)
 	if err != nil {
 		return fmt.Errorf("sync write failed: %v", err)
@@ -332,13 +286,11 @@ func (d *Driver) SyncWrite(addr uint16, dataLength uint16, motors []SyncWriteDat
 		return fmt.Errorf("sync write incomplete: sent %d/%d bytes", n, len(tx))
 	}
 
-	// Small delay to ensure packet transmission completes
 	time.Sleep(time.Millisecond)
-
 	return nil
 }
 
-// SyncWrite4Byte writes 4-byte values to multiple motors
+// SyncWrite4Byte writes 4-byte values to multiple motors.
 func (d *Driver) SyncWrite4Byte(addr uint16, values map[uint8]uint32) error {
 	motors := make([]SyncWriteData, 0, len(values))
 	for id, val := range values {
@@ -349,26 +301,24 @@ func (d *Driver) SyncWrite4Byte(addr uint16, values map[uint8]uint32) error {
 	return d.SyncWrite(addr, 4, motors)
 }
 
-// SyncReadData represents expected data for a motor in sync read
+// SyncReadData represents the result for a single motor in a sync read.
 type SyncReadData struct {
 	ID   uint8
 	Data []byte
 	Err  error
 }
 
-// extractPacketFromBuffer extracts a single packet from buffer, returning the packet and remaining bytes
+// extractPacketFromBuffer extracts a single packet from buffer.
 func extractPacketFromBuffer(data []byte) (packet []byte, remaining []byte, err error) {
 	if len(data) < MinHeaderSize {
-		return nil, data, nil // Not enough data yet
+		return nil, data, nil
 	}
-
-	startIdx := findPacketStart(data)
+	startIdx := FindPacketStart(data)
 	if startIdx == -1 {
-		return nil, data, nil // No packet header found
+		return nil, data, nil
 	}
-
 	if len(data) < startIdx+MinHeaderSize {
-		return nil, data, nil // Not enough data for header
+		return nil, data, nil
 	}
 
 	bodyLen := uint16(data[startIdx+5]) | (uint16(data[startIdx+6]) << 8)
@@ -380,52 +330,44 @@ func extractPacketFromBuffer(data []byte) (packet []byte, remaining []byte, err 
 	if totalLen > MaxPacketSize {
 		return nil, nil, fmt.Errorf("packet length exceeds maximum: %d", totalLen)
 	}
-
 	if len(data) < totalLen {
-		return nil, data, nil // Not enough data for complete packet
+		return nil, data, nil
 	}
 
 	return data[startIdx:totalLen], data[totalLen:], nil
 }
 
-// SyncRead reads same address from multiple motors
+// SyncRead reads the same address range from multiple motors.
 func (d *Driver) SyncRead(addr uint16, dataLength uint16, ids []uint8) ([]SyncReadData, error) {
 	if len(ids) == 0 {
 		return nil, fmt.Errorf("no motor IDs provided")
 	}
 
-	// Build parameters: [Addr_L, Addr_H, Len_L, Len_H, ID1, ID2, ...]
 	params := make([]byte, 4+len(ids))
 	binary.LittleEndian.PutUint16(params[0:], addr)
 	binary.LittleEndian.PutUint16(params[2:], dataLength)
 	copy(params[4:], ids)
 
-	// Use broadcast ID for sync read request
 	tx := BuildPacket(0xFE, InstSyncRead, params)
-
-	// Send request
 	_, err := d.port.Write(tx)
 	if err != nil {
 		return nil, fmt.Errorf("sync read tx failed: %v", err)
 	}
 
-	// Read all responses using a shared buffer to handle responses arriving together
 	results := make([]SyncReadData, len(ids))
 	for i := range ids {
 		results[i].ID = ids[i]
 	}
 
-	deadline := time.Now().Add(d.Timeout * time.Duration(len(ids))) // Extend timeout for multiple motors
+	deadline := time.Now().Add(d.Timeout * time.Duration(len(ids)))
 	buf := make([]byte, 0, ReadBufferSize)
 	tmp := make([]byte, ReadBufferSize)
 	packetsFound := 0
 
 	for time.Now().Before(deadline) && packetsFound < len(ids) {
-		// Try to extract packets from existing buffer first
 		for packetsFound < len(ids) {
 			packet, remaining, err := extractPacketFromBuffer(buf)
 			if err != nil {
-				// Buffer corrupted, try to recover by finding next header
 				if len(buf) > 3 {
 					buf = buf[1:]
 					continue
@@ -433,14 +375,12 @@ func (d *Driver) SyncRead(addr uint16, dataLength uint16, ids []uint8) ([]SyncRe
 				break
 			}
 			if packet == nil {
-				break // Need more data
+				break
 			}
 
-			// Parse the packet to find which motor it belongs to
 			respID, errCode, readParams, parseErr := ParsePacket(packet)
 			buf = remaining
 
-			// Find matching motor ID in results
 			for i, id := range ids {
 				if id == respID && results[i].Data == nil && results[i].Err == nil {
 					if parseErr != nil {
@@ -460,7 +400,6 @@ func (d *Driver) SyncRead(addr uint16, dataLength uint16, ids []uint8) ([]SyncRe
 			break
 		}
 
-		// Read more data from serial port
 		n, err := d.port.Read(tmp)
 		if err != nil {
 			break
@@ -472,7 +411,6 @@ func (d *Driver) SyncRead(addr uint16, dataLength uint16, ids []uint8) ([]SyncRe
 		buf = append(buf, tmp[:n]...)
 	}
 
-	// Mark any motors that didn't respond with timeout error
 	for i := range results {
 		if results[i].Data == nil && results[i].Err == nil {
 			results[i].Err = fmt.Errorf("timeout waiting for motor %d", ids[i])
@@ -482,9 +420,7 @@ func (d *Driver) SyncRead(addr uint16, dataLength uint16, ids []uint8) ([]SyncRe
 	return results, nil
 }
 
-// SyncRead4Byte reads 4-byte values from multiple motors.
-// Returns partial results: motors that responded successfully are included in the map.
-// Returns an error only if no motor responded at all.
+// SyncRead4Byte reads 4-byte values from multiple motors (partial results supported).
 func (d *Driver) SyncRead4Byte(addr uint16, ids []uint8) (map[uint8]uint32, error) {
 	results, err := d.SyncRead(addr, 4, ids)
 	if err != nil {
@@ -508,6 +444,5 @@ func (d *Driver) SyncRead4Byte(addr uint16, ids []uint8) (map[uint8]uint32, erro
 	if len(values) == 0 && lastErr != nil {
 		return nil, lastErr
 	}
-
 	return values, nil
 }

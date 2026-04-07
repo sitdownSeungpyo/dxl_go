@@ -1,4 +1,4 @@
-package dxl
+package dynamixel
 
 import (
 	"context"
@@ -8,6 +8,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"go_dxl/transport/serial"
 )
 
 // Channel buffer size defaults
@@ -18,107 +20,55 @@ const (
 
 // Timing defaults
 const (
-	DefaultEEPROMWriteDelay  = 1000 * time.Millisecond
+	DefaultEEPROMWriteDelay   = 1000 * time.Millisecond
 	DefaultTorqueDisableDelay = 150 * time.Millisecond
 )
 
 // PortOpener is a function type that opens a serial port.
-// This enables dependency injection for testing.
-type PortOpener func(devicePort string, baudRate int) (SerialPortInterface, error)
+type PortOpener func(devicePort string, baudRate int) (serial.Port, error)
 
-// Controller manages the Dynamixel communication loop
+// Controller manages the Dynamixel communication loop.
 type Controller struct {
 	driver     *Driver
 	devicePort string
 	baudRate   int
 
-	// Channels for communication with the control loop
 	CommandChan  chan []Command
 	FeedbackChan chan []Feedback
 
-	// Context for graceful shutdown
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
-	// Configuration
 	Model    MotorModel
-	MotorIDs []uint8 // List of motor IDs to control
+	MotorIDs []uint8
 
-	// Configurable timing
-	EEPROMWriteDelay   time.Duration // Delay after EEPROM write (default 1s)
-	TorqueDisableDelay time.Duration // Delay after torque disable (default 150ms)
+	EEPROMWriteDelay   time.Duration
+	TorqueDisableDelay time.Duration
 
-	// Dependency injection for testing
-	OpenPort PortOpener // Function to open serial port (default: OpenSerial)
+	OpenPort PortOpener
 
-	// Internal State
-	mu               sync.RWMutex // Protects shared state
+	mu               sync.RWMutex
 	activeGoalAddr   uint16
-	useSyncReadWrite bool // Enable sync read/write for better performance
+	useSyncReadWrite bool
 
-	// Monitoring
-	droppedFeedbacks atomic.Int64 // Count of dropped feedback messages
+	droppedFeedbacks atomic.Int64
 }
 
-// MotorModel defines the Control Table addresses for a specific motor type
-type MotorModel struct {
-	AddrTorqueEnable    uint16
-	AddrGoalPosition    uint16
-	AddrGoalVelocity    uint16
-	AddrGoalPWM         uint16
-	AddrGoalCurrent     uint16 // Goal Current address (X-Series: 102)
-	AddrPresentPosition uint16
-	AddrOperatingMode   uint16
-}
-
-// Command represents a write command to a motor
+// Command represents a write command to a motor.
 type Command struct {
 	ID    uint8
 	Value uint32
 }
 
-// Feedback represents a read value from a motor
+// Feedback represents a read value from a motor.
 type Feedback struct {
 	ID    uint8
 	Value uint32
 	Error error
 }
 
-// Common Motor Models (Protocol 2.0 examples)
-var (
-	// X-Series (XM430, XC430, etc.) & MX-Series (Protocol 2.0 firmware)
-	ModelXSeries = MotorModel{
-		AddrTorqueEnable:    64,
-		AddrGoalPosition:    116,
-		AddrGoalVelocity:    104,
-		AddrGoalPWM:         100,
-		AddrGoalCurrent:     102,
-		AddrPresentPosition: 132,
-		AddrOperatingMode:   11,
-	}
-	// Pro-Series (H54, H42, etc.)
-	ModelProSeries = MotorModel{
-		AddrTorqueEnable:    562, // Example, verify for specific PRO model
-		AddrGoalPosition:    596,
-		AddrGoalVelocity:    600, // Check Manual
-		AddrGoalPWM:         584, // Check Manual
-		AddrGoalCurrent:     590, // Check Manual for specific PRO model
-		AddrPresentPosition: 611,
-		AddrOperatingMode:   11, // PRO Series often shares 11 too, need check
-	}
-	// PRO+ Series usually similar to X-Series layout or specific
-)
-
-const (
-	OpModeCurrent          = 0
-	OpModeVelocity         = 1
-	OpModePosition         = 3
-	OpModeExtendedPosition = 4
-	OpModeCurrentBasedPos  = 5
-	OpModePWM              = 16
-)
-
+// NewController creates a new Dynamixel controller.
 func NewController(devicePort string, baudRate int, model MotorModel) *Controller {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Controller{
@@ -129,27 +79,21 @@ func NewController(devicePort string, baudRate int, model MotorModel) *Controlle
 		ctx:                ctx,
 		cancel:             cancel,
 		Model:              model,
-		MotorIDs:           []uint8{1}, // Default single motor
-		activeGoalAddr:     model.AddrGoalPosition, // Default Address
-		useSyncReadWrite:   false, // Default to individual commands for single motor
+		MotorIDs:           []uint8{1},
+		activeGoalAddr:     model.AddrGoalPosition,
+		useSyncReadWrite:   false,
 		EEPROMWriteDelay:   DefaultEEPROMWriteDelay,
 		TorqueDisableDelay: DefaultTorqueDisableDelay,
 		OpenPort:           defaultOpenPort,
 	}
 }
 
-// defaultOpenPort is the default PortOpener that calls OpenSerial
-func defaultOpenPort(devicePort string, baudRate int) (SerialPortInterface, error) {
-	return OpenSerial(devicePort, baudRate)
+func defaultOpenPort(devicePort string, baudRate int) (serial.Port, error) {
+	return serial.Open(devicePort, baudRate)
 }
 
-// MaxValidMotorID is the maximum valid Dynamixel motor ID (253-255 are reserved)
-const MaxValidMotorID = 252
-
-// SetMotorIDs configures which motors to control
-// Automatically enables sync read/write if multiple motors
-// Thread-safe: can be called while control loop is running
-// Returns error if any motor ID is invalid (must be 0-252)
+// SetMotorIDs configures which motors to control.
+// Automatically enables sync read/write for multiple motors.
 func (c *Controller) SetMotorIDs(ids []uint8) error {
 	for _, id := range ids {
 		if id > MaxValidMotorID {
@@ -163,7 +107,6 @@ func (c *Controller) SetMotorIDs(ids []uint8) error {
 	return nil
 }
 
-// getMotorIDs returns a copy of motor IDs (thread-safe)
 func (c *Controller) getMotorIDs() []uint8 {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -172,23 +115,20 @@ func (c *Controller) getMotorIDs() []uint8 {
 	return ids
 }
 
-// isSyncMode returns whether sync read/write is enabled (thread-safe)
 func (c *Controller) isSyncMode() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.useSyncReadWrite
 }
 
-// getActiveGoalAddr returns the active goal address (thread-safe)
 func (c *Controller) getActiveGoalAddr() uint16 {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.activeGoalAddr
 }
 
-// Start spawns the control loop goroutine
+// Start begins the control loop.
 func (c *Controller) Start() error {
-	// Input validation
 	if c.devicePort == "" {
 		return fmt.Errorf("device port must not be empty")
 	}
@@ -200,7 +140,6 @@ func (c *Controller) Start() error {
 		return fmt.Errorf("motor model has uninitialized addresses")
 	}
 
-	// 1. Open Serial Port
 	opener := c.OpenPort
 	if opener == nil {
 		opener = defaultOpenPort
@@ -212,13 +151,12 @@ func (c *Controller) Start() error {
 
 	c.driver = NewDriver(sp)
 
-	// 2. Ping and enable torque for all configured motors
 	for _, id := range motorIDs {
 		fmt.Printf("Pinging Motor ID %d...\n", id)
 		model, err := c.driver.Ping(id)
 		if err != nil {
 			sp.Close()
-			return fmt.Errorf("ping failed for ID %d: %v. Check Power/ID/Baudrate", id, err)
+			return fmt.Errorf("ping failed for ID %d: %v", id, err)
 		}
 		fmt.Printf("Motor ID %d Found! Model Number: %d\n", id, model)
 
@@ -228,10 +166,8 @@ func (c *Controller) Start() error {
 		}
 	}
 
-	// Start the control loop in a separate goroutine
 	c.wg.Add(1)
 	go c.controlLoop()
-
 	return nil
 }
 
@@ -239,21 +175,15 @@ func (c *Controller) enableTorque(id uint8) error {
 	if c.driver == nil {
 		return fmt.Errorf("controller not started")
 	}
-	// Write 1 to proper address
 	fmt.Printf("Enabling Torque for ID %d at address %d...\n", id, c.Model.AddrTorqueEnable)
-	err := c.driver.Write(id, c.Model.AddrTorqueEnable, []byte{1})
-	if err != nil {
+	if err := c.driver.Write(id, c.Model.AddrTorqueEnable, []byte{1}); err != nil {
 		return err
 	}
 
-	// Small delay to let motor process the command
 	time.Sleep(50 * time.Millisecond)
 
-	// Verify (optional - can be disabled if causing issues)
-	// Read 1 Byte
 	data, err := c.driver.Read(id, c.Model.AddrTorqueEnable, 1)
 	if err != nil {
-		// If read fails, assume write succeeded (some motors don't respond well to rapid read after write)
 		fmt.Printf("Warning: Could not verify torque enable (read error: %v), assuming success\n", err)
 		return nil
 	}
@@ -262,7 +192,6 @@ func (c *Controller) enableTorque(id uint8) error {
 		return nil
 	}
 	if data[0] != 1 {
-		// Print warning but don't fail - the write command succeeded
 		fmt.Printf("Warning: Torque enable readback mismatch (expected 1, got %d), but write succeeded\n", data[0])
 	}
 	return nil
@@ -276,19 +205,15 @@ func (c *Controller) disableTorque(id uint8) error {
 	return c.driver.Write(id, c.Model.AddrTorqueEnable, []byte{0})
 }
 
-// SetOperatingMode changes the control mode (Torque Disable -> Set Mode -> Torque Enable)
-// Common Modes: 1 (Velocity), 3 (Position), 16 (PWM)
+// SetOperatingMode changes the control mode.
 func (c *Controller) SetOperatingMode(id uint8, mode uint8) error {
-	// Increase timeout temporarily for EEPROM operations
 	originalTimeout := c.driver.Timeout
 	c.driver.Timeout = 500 * time.Millisecond
 	defer func() { c.driver.Timeout = originalTimeout }()
 
-	// Flush serial buffers and wait for previous operations to complete
 	c.driver.Flush()
 	time.Sleep(100 * time.Millisecond)
 
-	// Check current mode first - skip if already set (avoids unnecessary EEPROM writes)
 	currentMode, err := c.driver.Read(id, c.Model.AddrOperatingMode, 1)
 	if err != nil {
 		fmt.Printf("Warning: could not read current mode for motor %d: %v\n", id, err)
@@ -296,7 +221,6 @@ func (c *Controller) SetOperatingMode(id uint8, mode uint8) error {
 		fmt.Printf("Motor %d current mode: %d (target: %d)\n", id, currentMode[0], mode)
 		if currentMode[0] == mode {
 			fmt.Printf("Motor %d already in mode %d, skipping EEPROM write...\n", id, mode)
-			// Still need to update internal state and ensure torque is on
 			c.mu.Lock()
 			c.activeGoalAddr = c.goalAddrForMode(mode)
 			c.mu.Unlock()
@@ -304,7 +228,6 @@ func (c *Controller) SetOperatingMode(id uint8, mode uint8) error {
 		}
 	}
 
-	// 1. Disable Torque - flush buffer first to clear any stale data
 	c.driver.Flush()
 	time.Sleep(10 * time.Millisecond)
 
@@ -312,39 +235,28 @@ func (c *Controller) SetOperatingMode(id uint8, mode uint8) error {
 		return fmt.Errorf("failed to disable torque: %v", err)
 	}
 
-	// Wait for motor to process torque disable before EEPROM write
 	time.Sleep(c.TorqueDisableDelay)
 
-	// Verify torque is actually disabled before writing to EEPROM
 	c.driver.Flush()
 	data, err := c.driver.Read(id, c.Model.AddrTorqueEnable, 1)
 	if err != nil {
 		fmt.Printf("Warning: could not verify torque disable: %v\n", err)
-		// Add extra delay if verification failed
 		time.Sleep(100 * time.Millisecond)
-	} else if len(data) > 0 {
-		fmt.Printf("Torque status for motor %d: %d\n", id, data[0])
-		if data[0] != 0 {
-			// Retry disable if still enabled
-			fmt.Printf("Torque still enabled, retrying...\n")
-			if err := c.disableTorque(id); err != nil {
-				return fmt.Errorf("failed to disable torque (retry): %v", err)
-			}
-			time.Sleep(100 * time.Millisecond)
+	} else if len(data) > 0 && data[0] != 0 {
+		fmt.Printf("Torque still enabled, retrying...\n")
+		if err := c.disableTorque(id); err != nil {
+			return fmt.Errorf("failed to disable torque (retry): %v", err)
 		}
+		time.Sleep(100 * time.Millisecond)
 	}
 
-	// 2. Set Mode
 	fmt.Printf("Setting Operating Mode to %d for ID %d...\n", mode, id)
 	if err := c.driver.Write(id, c.Model.AddrOperatingMode, []byte{mode}); err != nil {
 		return fmt.Errorf("failed to set operating mode: %v", err)
 	}
 
-	// EEPROM Write Delay: Operating Mode change requires reboot/flash time.
-	// This happens ONLY ONCE at startup, so it does not affect control loop performance.
 	time.Sleep(c.EEPROMWriteDelay)
 
-	// Verify mode was actually set
 	data, err = c.driver.Read(id, c.Model.AddrOperatingMode, 1)
 	if err != nil {
 		fmt.Printf("Warning: could not verify operating mode (read error: %v)\n", err)
@@ -352,21 +264,16 @@ func (c *Controller) SetOperatingMode(id uint8, mode uint8) error {
 		return fmt.Errorf("operating mode verification failed: wrote %d, read back %d", mode, data[0])
 	}
 
-	// Update Active Goal Address (thread-safe)
 	c.mu.Lock()
 	c.activeGoalAddr = c.goalAddrForMode(mode)
 	c.mu.Unlock()
 
-	// 3. Re-Enable Torque
 	if err := c.enableTorque(id); err != nil {
 		return fmt.Errorf("failed to enable torque: %v", err)
 	}
-
 	return nil
 }
 
-// goalAddrForMode returns the appropriate goal address for the given operating mode.
-// Must be called with knowledge of the Model field; does not acquire locks.
 func (c *Controller) goalAddrForMode(mode uint8) uint16 {
 	switch mode {
 	case OpModeVelocity:
@@ -386,7 +293,7 @@ func (c *Controller) goalAddrForMode(mode uint8) uint16 {
 	}
 }
 
-// Stop signals the control loop to exit and waits for it to finish
+// Stop signals the control loop to exit and waits.
 func (c *Controller) Stop() {
 	c.cancel()
 	c.wg.Wait()
@@ -394,8 +301,6 @@ func (c *Controller) Stop() {
 
 func (c *Controller) controlLoop() {
 	defer c.wg.Done()
-
-	// 1. Lock OS Thread to reduce scheduler jitter
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	defer c.driver.port.Close()
@@ -404,11 +309,9 @@ func (c *Controller) controlLoop() {
 		select {
 		case <-c.ctx.Done():
 			return
-		// 1. Process Commands (Prioritized)
 		case cmds := <-c.CommandChan:
 			goalAddr := c.getActiveGoalAddr()
 			if c.isSyncMode() {
-				// Use Sync Write for multiple motors (more efficient)
 				values := make(map[uint8]uint32)
 				for _, cmd := range cmds {
 					values[cmd.ID] = cmd.Value
@@ -417,7 +320,6 @@ func (c *Controller) controlLoop() {
 					fmt.Printf("SyncWrite error: %v\n", err)
 				}
 			} else {
-				// Individual writes for single motor or legacy mode
 				for _, cmd := range cmds {
 					if err := c.driver.Write4Byte(cmd.ID, goalAddr, cmd.Value); err != nil {
 						fmt.Printf("Write error for motor %d: %v\n", cmd.ID, err)
@@ -425,36 +327,30 @@ func (c *Controller) controlLoop() {
 				}
 			}
 		default:
-			// No commands, continue to reads
 		}
 
-		// 2. Read Feedback
 		var feedbacks []Feedback
 		motorIDs := c.getMotorIDs()
 
 		if c.isSyncMode() {
-			// Use Sync Read for multiple motors (more efficient)
-			// SyncRead4Byte returns partial results - use values for responding motors
 			values, syncErr := c.driver.SyncRead4Byte(c.Model.AddrPresentPosition, motorIDs)
 			if syncErr != nil {
 				log.Printf("SyncRead error: %v", syncErr)
 			}
 			for _, id := range motorIDs {
 				if val, ok := values[id]; ok {
-					feedbacks = append(feedbacks, Feedback{ID: id, Value: val, Error: nil})
+					feedbacks = append(feedbacks, Feedback{ID: id, Value: val})
 				} else {
-					feedbacks = append(feedbacks, Feedback{ID: id, Value: 0, Error: fmt.Errorf("no response from motor %d", id)})
+					feedbacks = append(feedbacks, Feedback{ID: id, Error: fmt.Errorf("no response from motor %d", id)})
 				}
 			}
 		} else {
-			// Individual reads for single motor
 			for _, id := range motorIDs {
 				val, err := c.driver.Read4Byte(id, c.Model.AddrPresentPosition)
 				feedbacks = append(feedbacks, Feedback{ID: id, Value: val, Error: err})
 			}
 		}
 
-		// Send feedback (non-blocking)
 		select {
 		case c.FeedbackChan <- feedbacks:
 		default:
@@ -466,7 +362,12 @@ func (c *Controller) controlLoop() {
 	}
 }
 
-// DroppedFeedbacks returns the number of feedback messages dropped due to a full channel.
+// DroppedFeedbacks returns the count of dropped feedback messages.
 func (c *Controller) DroppedFeedbacks() int64 {
 	return c.droppedFeedbacks.Load()
+}
+
+// Driver returns the underlying Driver (for advanced use).
+func (c *Controller) GetDriver() *Driver {
+	return c.driver
 }
